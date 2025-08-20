@@ -1,47 +1,42 @@
-# app.py
-import os, streamlit as st
-from polygon_data import fetch_daily_ohlc, PolygonError
-from core_strategy import decide
-from narrator import narrate
+import os, streamlit as st, pandas as pd
+from polygon_data import get_daily_ohlc
+from core_strategy import plan_for_user
+from narrator import speak
 from backtest import run_backtest
 
-st.set_page_config(page_title="CapIntel‑Q • Polygon", page_icon="🧭", layout="wide")
+st.set_page_config(page_title="CapIntel-Q • Polygon", page_icon="🧭", layout="centered")
 
-st.title("CapIntel‑Q — Polygon Edition")
+st.title("CapIntel-Q — Polygon Edition")
 
-ticker = st.text_input("Введите тикер (например, QQQ, AAPL, X:BTCUSD):", value="QQQ").strip().upper()
+with st.sidebar:
+    st.subheader("Диагностика")
+    st.write(f"Polygon ключ: {'ОК' if os.getenv('POLYGON_API_KEY') else 'нет'}")
+    st.write("Python: ОК")
+    st.caption("Источник данных: Polygon.io (аггрегированные дневные свечи)")
+
+ticker = st.text_input("Введите тикер (например, QQQ, AAPL, X:BTCUSD):", "QQQ")
 horizon = st.selectbox("Горизонт:", ["Трейд (1–5 дней)", "Среднесрок (1–4 недели)", "Долгосрок (1–6 месяцев)"])
 
-col1, col2 = st.columns([1,1])
+col1, col2 = st.columns(2)
 with col1:
-    if st.button("Проанализировать", type="primary"):
+    if st.button("Проанализировать", use_container_width=True):
         try:
-            df = fetch_daily_ohlc(ticker, 1800)
-            price = float(df["close"].iloc[-1])
-            idea = decide(df, horizon)
-            st.subheader("🧠 Результат")
-            st.write(narrate(ticker, horizon, price, idea))
-        except PolygonError as e:
-            st.error(f"Ошибка загрузки данных: {e}")
+            df = get_daily_ohlc(ticker, years=5)
+            v = plan_for_user(df, horizon)
+            st.subheader("Результат")
+            st.write(speak(ticker, horizon, v))
         except Exception as e:
-            st.error(f"Неожиданная ошибка: {e}")
+            st.error(f"Ошибка: {e}")
 
 with col2:
-    if st.button("Запустить бэктест"):
+    if st.button("Запустить бэктест", use_container_width=True):
         try:
-            bt = run_backtest(ticker, horizon, years=5)
-            if bt.empty:
-                st.warning("Бэктест не нашёл сделок по текущим фильтрам.")
+            table, win = run_backtest(ticker, years=5, horizon=horizon)
+            st.subheader("Результаты бэктеста")
+            if isinstance(table, pd.DataFrame) and len(table)>0:
+                st.dataframe(table, use_container_width=True, height=380)
+                st.success(f"Процент срабатывания TP (по TP1): {win*100:.1f}%")
             else:
-                st.dataframe(bt)
-                win = (bt["ret_pct"]>0).mean()*100
-                st.success(f"Всего сделок: {len(bt)}, доля положительных: {win:.1f}%")
-        except PolygonError as e:
-            st.error(f"Ошибка загрузки данных: {e}")
+                st.info("Сигналов по базовому плану не было.")
         except Exception as e:
-            st.error(f"Неожиданная ошибка: {e}")
-
-st.divider()
-with st.expander("Диагностика"):
-    st.write(f"POLYGON_API_KEY установлен: {'Да' if os.environ.get('POLYGON_API_KEY') else 'Нет'}")
-    st.write("Приложение не раскрывает внутренние расчёты и говорит «по‑человечески».")
+            st.error(f"Ошибка бэктеста: {e}")
