@@ -1,155 +1,105 @@
-# core_strategy.py
-from __future__ import annotations
-import pandas as pd
-import numpy as np
-from dataclasses import dataclass
+import numpy as np, pandas as pd
+from polygon_data import heikin_ashi, atr, prev_period_ohlc, fib_pivots
 
-@dataclass
-class PivotLevels:
-    P: float
-    R1: float
-    R2: float
-    R3: float
-    S1: float
-    S2: float
-    S3: float
-
-def heikin_base(df: pd.DataFrame) -> pd.DataFrame:
-    """Внутреннее сглаживание (без разглашения наружу)."""
-    ha = df.copy()
-    ha["h_close"] = (df["open"] + df["high"] + df["low"] + df["close"]) / 4.0
-    ha["h_open"] = (df["open"].shift(1).fillna(df["open"]) + df["close"].shift(1).fillna(df["open"])) / 2.0
-    ha["h_high"] = ha[["h_open", "h_close", "high"]].max(axis=1)
-    ha["h_low"]  = ha[["h_open", "h_close", "low"]].min(axis=1)
-    ha["h_color"] = np.where(ha["h_close"] >= ha["h_open"], 1, -1)
-    return ha
-
-def atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
-    high, low, close = df["high"], df["low"], df["close"]
-    prev_close = close.shift(1)
-    tr = np.maximum.reduce([high-low, (high - prev_close).abs(), (low - prev_close).abs()])
-    return tr.rolling(n, min_periods=1).mean()
-
-def last_closed_period_hlc(df: pd.DataFrame, scope: str) -> tuple[float, float, float]:
-    idx = df.index
-    d = df.copy()
-    d["date"] = pd.to_datetime(d["date"])
-    if scope == "short":
-        # прошлая календарная неделя
-        d["year"] = d["date"].dt.isocalendar().year
-        d["week"] = d["date"].dt.isocalendar().week
-        last_y, last_w = d.iloc[-1][["year","week"]]
-        mask = (d["year"] < last_y) | ((d["year"] == last_y) & (d["week"] < last_w))
-        past = d[mask]
-        if past.empty:
-            past = d.iloc[:-1]
-        grp = past.groupby(["year","week"])[["high","low","close"]].agg({"high":"max","low":"min","close":"last"}).reset_index(drop=True)
-        period = grp.iloc[-1]
-    elif scope == "mid":
-        # прошлый месяц
-        d["ym"] = d["date"].dt.to_period("M")
-        last_ym = d.iloc[-1]["ym"]
-        past = d[d["ym"] < last_ym]
-        if past.empty:
-            past = d.iloc[:-1]
-        grp = past.groupby("ym")[["high","low","close"]].agg({"high":"max","low":"min","close":"last"}).reset_index(drop=True)
-        period = grp.iloc[-1]
+def _last_monochrome_run(ha: pd.DataFrame) -> tuple[int, str]:
+    """Сколько подряд шли «зелёные» HA (HA_Close>HA_Open) или «красные»."""
+    up = (ha["HA_Close"] > ha["HA_Open"]).astype(int)
+    down = (ha["HA_Close"] < ha["HA_Open"]).astype(int)
+    run, color = 1, "flat"
+    if len(up) < 2:
+        return 0, color
+    # идём с конца
+    i = len(up) - 1
+    if up.iloc[i] == 1:
+        color = "green"
+        while i > 0 and up.iloc[i-1] == 1:
+            run += 1; i -= 1
+    elif down.iloc[i] == 1:
+        color = "red"
+        while i > 0 and down.iloc[i-1] == 1:
+            run += 1; i -= 1
     else:
-        # прошлый год
-        d["y"] = d["date"].dt.year
-        last_y = d.iloc[-1]["y"]
-        past = d[d["y"] < last_y]
-        if past.empty:
-            past = d.iloc[:-1]
-        grp = past.groupby("y")[["high","low","close"]].agg({"high":"max","low":"min","close":"last"}).reset_index(drop=True)
-        period = grp.iloc[-1]
-    return float(period["high"]), float(period["low"]), float(period["close"])
+        run, color = 0, "flat"
+    return run, color
 
-def fib_pivots_from(prev_high: float, prev_low: float, prev_close: float) -> PivotLevels:
-    P = (prev_high + prev_low + prev_close) / 3.0
-    rng = prev_high - prev_low
-    R1 = P + 0.382 * rng
-    R2 = P + 0.618 * rng
-    R3 = P + 1.000 * rng
-    S1 = P - 0.382 * rng
-    S2 = P - 0.618 * rng
-    S3 = P - 1.000 * rng
-    return PivotLevels(P, R1, R2, R3, S1, S2, S3)
+def _near_belt(price: float, piv: dict, side: str, tol: float) -> bool:
+    """side in {'top','bottom'} — близость к верхнему или нижнему поясу пивотов"""
+    if side == "top":
+        ref = piv["R2"]
+        return price >= (ref - tol)
+    if side == "bottom":
+        ref = piv["S2"]
+        return price <= (ref + tol)
+    return False
 
-def decide(df: pd.DataFrame, horizon: str) -> dict:
-    # horizon: "short" (1-5д), "mid" (1-4нед), "long" (1-6мес)
-    scope = {"Трейд (1–5 дней)":"short", "Среднесрок (1–4 недели)":"mid", "Долгосрок (1–6 месяцев)":"long"}.get(horizon, "mid")
-    ha = heikin_base(df)
-    recent = ha.iloc[-80:].copy()
-    # серия цвета
-    recent["run"] = (recent["h_color"] != recent["h_color"].shift(1)).cumsum()
-    run_len = recent.groupby("run")["h_color"].transform("size")
-    last_run_len = int(run_len.iloc[-1])
-    last_color = int(recent["h_color"].iloc[-1])
-    # пивоты по прошлому завершенному периоду
-    ph, pl, pc = last_closed_period_hlc(df, scope)
-    piv = fib_pivots_from(ph, pl, pc)
-    last_close = float(df["close"].iloc[-1])
-    # ATR для масштаба
-    a = float(atr(df, 14).iloc[-1])
-    if a <= 0 or np.isnan(a): a = max(1.0, (df["high"].iloc[-30:-1].max() - df["low"].iloc[-30:-1].min())/30.0)
+def choose_period(horizon: str) -> str:
+    # 'Трейд','Среднесрок','Долгосрок'
+    h = horizon.lower()
+    if "5" in h or "трей" in h:
+        return "week"
+    if "сред" in h:
+        return "month"
+    return "year"
 
-    # расстояния
-    top = piv.R3
-    bottom = piv.S3
-    center = piv.P
+def plan_for_user(df: pd.DataFrame, horizon: str) -> dict:
+    """Возвращает текстовые уровни без упоминания индикаторов."""
+    ha = heikin_ashi(df)
+    df["ATR14"] = atr(df)
+    price = float(df["Close"].iloc[-1])
+    volat = float(df["ATR14"].iloc[-1])
 
-    # логика "интуиции"
-    near_top = last_close > piv.R2
-    near_bottom = last_close < piv.S2
-    long_green = (last_color == 1 and last_run_len >= 5)
-    long_red   = (last_color == -1 and last_run_len >= 5)
+    period = choose_period(horizon)
+    H,L,C = prev_period_ohlc(df, period)
+    piv = fib_pivots(H,L,C)
 
-    idea = {"action":"WAIT", "entry":None, "tp1":None, "tp2":None, "sl":None, "notes":[]}
+    run, color = _last_monochrome_run(ha)
+    # пороги серии – зависят от горизонта
+    need_run = 4 if period=="week" else (6 if period=="month" else 8)
 
-    width = max(2*a, (piv.R2 - piv.S2)/12.0)  # разумная ширина зоны/стопа
+    # толеранс – от волатильности
+    tol = max(volat, 0.01)*1.2
 
-    if near_top and long_green:
-        # базово: шорт сверху
-        idea["action"] = "SHORT"
-        idea["entry"] = round(last_close, 2)
-        idea["tp1"] = round((center + piv.R1)/2.0, 2)  # к центру
-        idea["tp2"] = round(center, 2)
-        idea["sl"] = round(min(top + width, last_close + 2*width), 2)
-        idea["notes"].append("Рынок выглядел перегретым у верхней кромки; берём там, где перевес наш.")
-    elif near_bottom and long_red:
-        # базово: лонг снизу
-        idea["action"] = "BUY"
-        idea["entry"] = round(last_close, 2)
-        idea["tp1"] = round((center + piv.S1)/2.0, 2)
-        idea["tp2"] = round(center, 2)
-        idea["sl"] = round(max(bottom - width, last_close - 2*width), 2)
-        idea["notes"].append("Рынок выглядел истощённым у нижней кромки; берём там, где перевес наш.")
+    base, alt, note = {}, {}, ""
+    # ЛОГИКА: длинная зелёная серия высоко → предпочтение шорту; длинная красная низко → лонг
+    if run >= need_run and color == "green" and _near_belt(price, piv, "top", tol):
+        # базовый: SHORT
+        entry = round(price, 2)
+        tp1  = round(max(piv["R1"], piv["P"]) - 0.6*volat, 2)
+        tp2  = round(piv["P"] - 1.2*volat, 2)
+        sl   = round(piv["R3"] + 1.0*volat, 2)
+        base = {"action":"SHORT", "entry":entry, "tp1":tp1, "tp2":tp2, "sl":sl}
+        # альтернатива: BUY от перегруза после отката в пояс «середины»
+        alt  = {"action":"BUY",
+                "entry": round(piv["P"] + 0.1*volat, 2),
+                "tp1":   round(piv["R1"] - 0.3*volat, 2),
+                "tp2":   round(piv["R2"] - 0.6*volat, 2),
+                "sl":    round(piv["S1"] - 0.8*volat, 2)}
+        note = "Рынок перегрет ростом; работаем от ослабления."
+    elif run >= need_run and color == "red" and _near_belt(price, piv, "bottom", tol):
+        # базовый: BUY
+        entry = round(price, 2)
+        tp1  = round(min(piv["S1"], piv["P"]) + 0.6*volat, 2)
+        tp2  = round(piv["P"] + 1.2*volat, 2)
+        sl   = round(piv["S3"] - 1.0*volat, 2)
+        base = {"action":"BUY", "entry":entry, "tp1":tp1, "tp2":tp2, "sl":sl}
+        # альтернатива: SHORT после отскока к средней зоне
+        alt = {"action":"SHORT",
+               "entry": round(piv["P"] - 0.1*volat, 2),
+               "tp1":   round(piv["S1"] + 0.3*volat, 2),
+               "tp2":   round(piv["S2"] + 0.6*volat, 2),
+               "sl":    round(piv["R1"] + 0.8*volat, 2)}
+        note = "Рынок выжат; берём восстановление."
     else:
-        # нет явного перевеса — ждём формацию и даём зону внимания
-        idea["notes"].append("Сейчас вход не даёт преимущества. Ждём формацию в области интереса.")
-        # область интереса ближе к центру баланса периода
-        z1 = round(center - a, 2)
-        z2 = round(center + a, 2)
-        idea["entry"] = f"{z1}–{z2}"
-        # защиту и цели не навязываем, чтобы не провоцировать «тонкие» входы
-        idea["tp1"] = None
-        idea["tp2"] = None
-        idea["sl"] = None
+        base = {"action":"WAIT"}
+        # «область наблюдения» — не раскрываем уровни, только цены
+        watch_low  = round(min(piv["P"], piv["S1"]) - 0.5*volat, 2)
+        watch_high = round(max(piv["P"], piv["R1"]) + 0.5*volat, 2)
+        alt  = {"action":"SCOUT", "watch_from":watch_low, "watch_to":watch_high}
+        note = "Импульс не даёт преимущества."
 
-    # сглаживание экстремумов для долгосрока (чтобы не были «коротышами»)
-    if scope == "long" and idea["action"] in ("BUY","SHORT"):
-        # растянуть цели минимум на 1.5*ATR от entry в сторону замысла,
-        # но не выходя за логичный центр периода
-        if idea["action"] == "SHORT":
-            min_tp = idea["entry"] - 1.5*a
-            idea["tp1"] = round(min(idea["tp1"], min_tp), 2) if idea["tp1"] else round(min_tp, 2)
-        else:
-            min_tp = idea["entry"] + 1.5*a
-            idea["tp1"] = round(max(idea["tp1"], min_tp), 2) if idea["tp1"] else round(min_tp, 2)
-
-    # финальная заметка
-    idea["notes"].append("Работаем спокойно: если сценарий ломается — быстро выходим и ждём новую формацию.")
-    # упаковка
-    idea["meta"] = {"pivot_center": round(center,2)}
-    return idea
+    return {
+        "price": round(price,2),
+        "base": base,
+        "alt": alt,
+        "note": note
+    }
